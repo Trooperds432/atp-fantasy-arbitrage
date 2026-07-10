@@ -1,0 +1,38 @@
+Budget: 7
+Free switches: 2
+Switches made: 7
+Switch cost: -250
+
+Team:
+Sinner 40
+Rublev 9
+Darderi 8
+Zverev 36
+Davidovich Fokina 8
+Djokovic 21
+Hurkacz 3
+Basilashvili 1
+
+Players:
+Sinner 40
+Zverev 36
+Auger-Aliassime 30
+de Minaur 27
+Shelton 24
+Medvedev 21
+Djokovic 21
+Cobolli 17
+Fritz 15
+Bublik 14
+Lehecka 13
+Ruud 12
+Musetti 11
+Tien 10
+Rublev 9
+Darderi 8
+Davidovich Fokina 8
+Mensik 8
+Tiafoe 8
+Mpetshi Perricard 2
+Hurkacz 3
+Basilashvili 1
