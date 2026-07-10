@@ -91,6 +91,41 @@ The `Players:` section is important because ATP Fantasy credits are not always a
 
 ---
 
+## ATP Fantasy Player Prices
+
+Prices are based on players’ ranking position in the Official PIF ATP Live Rankings (Singles). The script uses this table as the fallback credit model when a player is missing from your pasted `Players:` section.
+
+| Ranking position | Credits |
+|---:|---:|
+| World No. 1 | 40 |
+| World No. 2 | 36 |
+| World No. 3 | 33 |
+| World No. 4 | 30 |
+| World No. 5 | 27 |
+| World No. 6 | 24 |
+| World No. 7 | 21 |
+| World No. 8 | 19 |
+| World No. 9 | 17 |
+| World No. 10 | 15 |
+| World No. 11 | 14 |
+| World No. 12 | 13 |
+| World No. 13 | 12 |
+| World No. 14 | 11 |
+| World No. 15 | 10 |
+| World No. 16 | 9 |
+| World No. 17–20 | 8 |
+| World No. 21–25 | 7 |
+| World No. 26–30 | 6 |
+| World No. 31–36 | 5 |
+| World No. 37–49 | 4 |
+| World No. 50–74 | 3 |
+| World No. 75–100 | 2 |
+| From World No. 101 | 1 |
+
+Note: World No. 16 is listed separately at 9 credits, so the next shared band starts at World No. 17.
+
+---
+
 ## `rankings.csv`
 
 You can now generate this automatically:
