@@ -1,0 +1,4 @@
+# One update stage per line.
+# Same line = batched update.
+Djokovic=win
+Cobolli=win, Fritz=win
