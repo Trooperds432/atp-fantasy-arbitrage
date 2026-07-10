@@ -2,25 +2,42 @@
 """ATP Fantasy credit-arbitrage CLI.
 
 Manual-confirmation tool only: it never logs in, clicks, saves, or submits
-switches. You paste your Fantasy prices and ATP live-ranking projections into
-local files, then it recommends what to sell/buy before staged price updates.
+switches. It can now fetch ATP Live Rankings directly from:
+https://www.atptour.com/en/rankings/singles/live
+
+Workflow:
+  1) Keep fantasy_state.txt updated with your Fantasy team/prices.
+  2) Run with --fetch-live to refresh rankings.csv from ATP.
+  3) Put staged outcomes in scenario.txt.
+  4) Read the recommended manual sell/buy queue.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import html as html_lib
 import re
 import sys
 import unicodedata
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-TOP16_CREDITS = {1: 40, 2: 35, 3: 33, 4: 30, 5: 27, 6: 24, 7: 21, 8: 19,
-                 9: 17, 10: 15, 11: 14, 12: 13, 13: 12, 14: 11, 15: 10, 16: 9}
+ATP_LIVE_URL = "https://www.atptour.com/en/rankings/singles/live"
 
+TOP16_CREDITS = {
+    1: 40, 2: 35, 3: 33, 4: 30, 5: 27, 6: 24, 7: 21, 8: 19,
+    9: 17, 10: 15, 11: 14, 12: 13, 13: 12, 14: 11, 15: 10, 16: 9,
+}
+
+
+# ---------------------------------------------------------------------------
+# Fantasy credit model
+# ---------------------------------------------------------------------------
 
 def fallback_credit(rank: int) -> int:
+    """Fallback ATP Fantasy credit band if a Fantasy price is not pasted."""
     if rank in TOP16_CREDITS:
         return TOP16_CREDITS[rank]
     if 17 <= rank <= 20:
@@ -48,7 +65,7 @@ def norm(name: str) -> str:
 
 
 def number(text: str) -> int:
-    m = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", "").replace("−", "-"))
+    m = re.search(r"[+-]?\d+(?:\.\d+)?", text.replace(",", "").replace("−", "-"))
     if not m:
         raise ValueError(f"No number found in {text!r}")
     return int(float(m.group(0)))
@@ -59,11 +76,12 @@ def resolve(query: str, keys: Iterable[str]) -> Optional[str]:
     q = norm(query)
     if q in keys:
         return q
-    q_last = q.split()[-1] if q.split() else q
+    parts = q.split()
+    q_last = parts[-1] if parts else q
     hits = []
     for k in keys:
-        parts = k.split()
-        if parts and (parts[-1] == q_last or k.endswith(" " + q) or q in k):
+        k_parts = k.split()
+        if k_parts and (k_parts[-1] == q_last or k.endswith(" " + q) or q in k):
             hits.append(k)
     return hits[0] if len(hits) == 1 else None
 
@@ -91,6 +109,191 @@ class Fantasy:
     team: Dict[str, Price]
     players: Dict[str, Price]
 
+
+# ---------------------------------------------------------------------------
+# ATP website extraction
+# ---------------------------------------------------------------------------
+
+def fetch_url(url: str, timeout: int = 30) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace")
+
+
+def html_to_lines(raw_html: str) -> List[str]:
+    """Convert ATP HTML into a stable text-line stream for row parsing."""
+    text = re.sub(r"(?is)<script.*?</script>", " ", raw_html)
+    text = re.sub(r"(?is)<style.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript.*?</noscript>", " ", text)
+
+    # Force line breaks around common block/table elements before stripping tags.
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(
+        r"(?i)</?(tr|td|th|li|ul|ol|div|p|section|article|h[1-6]|span|a)[^>]*>",
+        "\n",
+        text,
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = text.replace("\u00a0", " ")
+    out: List[str] = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+BAD_NAME_PREFIXES = (
+    "image", "headshot", "tournament", "defeated", "lost", "withdrawn", "retired",
+    "walkover", "live rank", "player", "official", "current tournament", "rank range",
+)
+BAD_NAME_EXACT = {
+    "wimbledon", "newport", "braunschweig", "stuttgart", "halle", "london",
+    "singles", "doubles", "live", "refresh", "age", "profile", "latest",
+}
+
+
+def _looks_like_player_name(line: str) -> bool:
+    low = line.lower().strip()
+    if low in BAD_NAME_EXACT:
+        return False
+    if any(low.startswith(p) for p in BAD_NAME_PREFIXES):
+        return False
+    if "{{" in line or "}}" in line:
+        return False
+    if re.search(r"\d", line):
+        return False
+    # Accept names like "Jannik Sinner", "A. Zverev", "Alex de Minaur".
+    if not re.search(r"[A-Za-z]", line):
+        return False
+    words = [w for w in re.split(r"\s+", line) if w]
+    if len(words) < 2:
+        return False
+    if len(line) > 45:
+        return False
+    return True
+
+
+def _extract_int_tokens(line: str) -> List[int]:
+    # Remove round labels so R128/R64 do not contaminate point extraction.
+    cleaned = re.sub(r"\bR\d+\b", " ", line, flags=re.IGNORECASE)
+    tokens = re.findall(r"[+-]?\d{1,3}(?:,\d{3})*|[+-]?\d+", cleaned.replace("−", "-"))
+    vals: List[int] = []
+    for tok in tokens:
+        try:
+            vals.append(int(tok.replace(",", "")))
+        except ValueError:
+            pass
+    return vals
+
+
+def parse_atp_live_rankings_html(raw_html: str, rank_limit: int = 100) -> List[Ranking]:
+    """Parse ATP live rankings page into Ranking rows.
+
+    The ATP page exposes both a compact table and a full table in the HTML. This
+    parser prefers the full table because it contains full player names. It uses
+    sequential rank markers (1, 2, 3...) to avoid confusing player ages with ranks.
+    """
+    lines = html_to_lines(raw_html)
+
+    header_idx = None
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if "live rank" in low and "official points" in low and "next" in low:
+            header_idx = i
+            break
+    if header_idx is None:
+        for i, line in enumerate(lines):
+            low = line.lower()
+            if "live rank" in low and "next" in low and "max points" in low:
+                header_idx = i
+                break
+    if header_idx is None:
+        raise RuntimeError("Could not find ATP live-ranking table header in page HTML")
+
+    rows: List[Ranking] = []
+    pos = header_idx + 1
+    expected_rank = 1
+
+    def find_rank(start: int, target: int) -> Optional[int]:
+        needle = str(target)
+        for j in range(start, len(lines)):
+            if lines[j] == needle:
+                return j
+        return None
+
+    start = find_rank(pos, expected_rank)
+    while start is not None and expected_rank <= rank_limit:
+        next_start = find_rank(start + 1, expected_rank + 1)
+        block = lines[start + 1: next_start if next_start is not None else min(len(lines), start + 80)]
+
+        name = None
+        name_idx = 0
+        for bi, bline in enumerate(block):
+            if _looks_like_player_name(bline):
+                name = bline
+                name_idx = bi
+                break
+
+        # Pull numeric tokens after the name, skipping age-only lines.
+        nums: List[int] = []
+        for bline in block[name_idx + 1:]:
+            if re.fullmatch(r"\d{1,2}", bline.strip()):
+                continue  # age
+            vals = _extract_int_tokens(bline)
+            if vals:
+                nums.extend(vals)
+
+        # In the full table, the first numeric token after the name/status is live points.
+        # Then official points, +/- and optionally next/max points follow.
+        if name and nums:
+            live_points = nums[0]
+            next_points = None
+            if len(nums) >= 5:
+                # current, official, delta, next, max
+                next_points = nums[-2]
+            elif len(nums) == 4:
+                # compact active row: current, delta, next, max
+                next_points = nums[-2]
+            rows.append(Ranking(name=name, points=live_points, next_points=next_points, rank=expected_rank))
+
+        expected_rank += 1
+        if next_start is None:
+            break
+        start = next_start
+
+    if not rows:
+        raise RuntimeError("ATP page was fetched, but no ranking rows were parsed")
+    return rows[:rank_limit]
+
+
+def fetch_atp_live_rankings(url: str = ATP_LIVE_URL, rank_limit: int = 100) -> List[Ranking]:
+    return parse_atp_live_rankings_html(fetch_url(url), rank_limit=rank_limit)
+
+
+def write_rankings_csv(rankings: List[Ranking], path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["rank", "player", "current", "next"])
+        for r in rankings:
+            writer.writerow([r.rank or "", r.name, r.points, r.next_points if r.next_points is not None else ""])
+
+
+# ---------------------------------------------------------------------------
+# Local file parsing
+# ---------------------------------------------------------------------------
 
 def parse_name_credit(line: str) -> Optional[Tuple[str, int]]:
     line = line.strip().replace("—", "-").replace("–", "-")
@@ -217,6 +420,10 @@ def parse_scenario(path: Path) -> List[List[Tuple[str, str]]]:
     return stages
 
 
+# ---------------------------------------------------------------------------
+# Simulation and optimisation
+# ---------------------------------------------------------------------------
+
 def sort_rankings(rankings: Dict[str, Ranking], points: Dict[str, int]) -> List[Tuple[str, Ranking, int]]:
     rows = [(k, r, points.get(k, r.points)) for k, r in rankings.items()]
     rows.sort(key=lambda x: (-x[2], x[1].rank if x[1].rank is not None else 9999, x[1].name))
@@ -230,7 +437,12 @@ def rank_price_schedule(rankings: Dict[str, Ranking], prices: Dict[str, Price], 
     return sched
 
 
-def simulate(rankings: Dict[str, Ranking], points: Dict[str, int], stage: List[Tuple[str, str]], schedule: Dict[int, int]) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
+def simulate(
+    rankings: Dict[str, Ranking],
+    points: Dict[str, int],
+    stage: List[Tuple[str, str]],
+    schedule: Dict[int, int],
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
     new_points = dict(points)
     for name, value in stage:
         key = resolve(name, rankings.keys())
@@ -256,7 +468,16 @@ def simulate(rankings: Dict[str, Ranking], points: Dict[str, int], stage: List[T
     return new_points, ranks, credits
 
 
-def optimise(fantasy: Fantasy, rankings: Dict[str, Ranking], projected: Dict[str, int], current_credit: Dict[str, int], credit_only: bool, penalty_credit: int, hold_risers: bool, sell_fallers: bool) -> Tuple[List[str], Dict[str, int | List[str] | str]]:
+def optimise(
+    fantasy: Fantasy,
+    rankings: Dict[str, Ranking],
+    projected: Dict[str, int],
+    current_credit: Dict[str, int],
+    credit_only: bool,
+    penalty_credit: int,
+    hold_risers: bool,
+    sell_fallers: bool,
+) -> Tuple[List[str], Dict[str, int | List[str] | str]]:
     team = set(fantasy.team)
     total_budget = sum(p.credit for p in fantasy.team.values()) + fantasy.budget
     required: Set[str] = set()
@@ -272,9 +493,11 @@ def optimise(fantasy: Fantasy, rankings: Dict[str, Ranking], projected: Dict[str
     forbidden -= required
 
     candidates: Dict[str, Tuple[int, int]] = {}
-    current_rank = {k: i for i, (k, _, _) in enumerate(sort_rankings(rankings, {k: r.points for k, r in rankings.items()}), 1)}
+    base_points = {k: r.points for k, r in rankings.items()}
+    current_rank = {k: i for i, (k, _, _) in enumerate(sort_rankings(rankings, base_points), 1)}
     for key, price in fantasy.players.items():
-        candidates[key] = (current_credit.get(key, price.credit), projected.get(key, current_credit.get(key, price.credit)))
+        cur = current_credit.get(key, price.credit)
+        candidates[key] = (cur, projected.get(key, cur))
     for key in rankings:
         if key not in candidates:
             cost = fallback_credit(current_rank.get(key, 999))
@@ -321,7 +544,11 @@ def optimise(fantasy: Fantasy, rankings: Dict[str, Ranking], projected: Dict[str
         excess = max(0, total_new - fantasy.free_switches)
         score = value + raw - (0 if credit_only else excess * penalty_credit)
         if score > best_score:
-            best_score, best_raw, best_picks, best_cost, best_new = score, value + raw, chosen + picks, spent + cst, total_new
+            best_score = score
+            best_raw = value + raw
+            best_picks = chosen + picks
+            best_cost = spent + cst
+            best_new = total_new
 
     return best_picks, {
         "total_budget": total_budget,
@@ -340,19 +567,35 @@ def dname(key: str, fantasy: Fantasy, rankings: Dict[str, Ranking]) -> str:
     return fantasy.players.get(key, Price(rankings.get(key, Ranking(key, 0)).name, 0)).name
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ATP Fantasy credit-arbitrage manual switch recommender")
-    ap.add_argument("--fantasy", required=True)
-    ap.add_argument("--rankings", required=True)
-    ap.add_argument("--scenario", required=True)
-    ap.add_argument("--points-aware", action="store_true")
-    ap.add_argument("--switch-penalty-credit", type=int, default=0)
-    ap.add_argument("--no-auto-hold-risers", action="store_true")
-    ap.add_argument("--no-auto-sell-fallers", action="store_true")
+    ap.add_argument("--fantasy", default="fantasy_state.txt", help="Fantasy team/prices text file")
+    ap.add_argument("--rankings", default="rankings.csv", help="ATP rankings CSV file")
+    ap.add_argument("--scenario", default="scenario.txt", help="Scenario stages file")
+    ap.add_argument("--fetch-live", action="store_true", help="Fetch ATP Live Rankings and overwrite --rankings before running")
+    ap.add_argument("--atp-url", default=ATP_LIVE_URL, help="ATP live rankings URL")
+    ap.add_argument("--rank-limit", type=int, default=100, help="Number of live-ranking rows to fetch")
+    ap.add_argument("--dump-rankings-only", action="store_true", help="Fetch/write rankings.csv, then exit")
+    ap.add_argument("--points-aware", action="store_true", help="Include switch penalty in objective")
+    ap.add_argument("--switch-penalty-credit", type=int, default=0, help="Credit-equivalent penalty per excess switch if --points-aware")
+    ap.add_argument("--no-auto-hold-risers", action="store_true", help="Do not force-hold owned players projected to rise")
+    ap.add_argument("--no-auto-sell-fallers", action="store_true", help="Do not force-sell owned players projected to fall")
     args = ap.parse_args()
 
+    rankings_path = Path(args.rankings)
+    if args.fetch_live:
+        rows = fetch_atp_live_rankings(args.atp_url, rank_limit=args.rank_limit)
+        write_rankings_csv(rows, rankings_path)
+        print(f"Fetched {len(rows)} ATP live-ranking rows -> {rankings_path}")
+        if args.dump_rankings_only:
+            return 0
+
     fantasy = parse_fantasy(Path(args.fantasy))
-    rankings = parse_rankings(Path(args.rankings))
+    rankings = parse_rankings(rankings_path)
     fantasy = canonicalise(fantasy, rankings)
     stages = parse_scenario(Path(args.scenario))
 
